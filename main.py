@@ -36,7 +36,8 @@ from dashboard_server import bot_state, start_web_dashboard
 # ==================== CONFIGURATION ====================
 WEB_HOST = "0.0.0.0"
 WEB_PORT = 20335
-ACCOUNTS_FILE = "accounts.json"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+ACCOUNTS_FILE = os.path.join(BASE_DIR, "accounts.json")
 TOKEN_CACHE_FILE = "token_cache.json"
 DEVICES_FILE = "devices.json"  # 🔥 NEW: Persistent device storage
 TOKEN_CACHE_TTL = 1200
@@ -1704,13 +1705,18 @@ async def informational(addrs, starter_packet, key, iv, region="BD", max_reconne
 def _register_credentials(account_data: Dict):
     try:
         acc_id = str(account_data['account_id'])
+        auth_uid = str(account_data.get('auth_uid', '')).strip()
+        auth_token = str(account_data.get('auth_token', '')).strip()
+        if bot_state.is_deleted(acc_id, auth_uid, auth_token, f'tok_{auth_token[:20]}' if auth_token else None):
+            return False
         bot_state.account_credentials[acc_id] = account_data
         if account_data.get('auth_uid'):
             bot_state.account_credentials[str(account_data['auth_uid'])] = account_data
         if account_data.get('auth_token'):
             bot_state.account_credentials[f"tok_{account_data['auth_token'][:20]}"] = account_data
+        return True
     except Exception:
-        pass
+        return False
 
 
 async def refresh_account_profile(account_data_or_uid: Any):
@@ -1758,6 +1764,8 @@ async def process_account_uid_pass(uid: str, password: str) -> Optional[Dict]:
     if cached:
         print_success(f"[CACHE HIT] UID {uid} loaded from token_cache.json (no login)")
         acc_id = str(cached['account_id'])
+        if bot_state.is_deleted(acc_id, uid if 'uid' in locals() else None):
+            return None
         bot_state.register_account(
             uid=acc_id,
             nickname=cached.get('nickname', f"Player_{acc_id}"),
@@ -1800,6 +1808,8 @@ async def process_account_uid_pass(uid: str, password: str) -> Optional[Dict]:
         nickname = res_proto.nickname or get_proto_field(dict_res, 4, f"Player_{acc_id}")
         region = majorlogin_response.region or get_proto_field(dict_res, 3, "BD")
 
+        if bot_state.is_deleted(acc_id, uid if 'uid' in locals() else None):
+            return None
         bot_state.register_account(uid=acc_id, nickname=nickname, region=region, level=level, exp=exp, likes=likes)
 
         account_data = {
@@ -1835,11 +1845,15 @@ async def process_account_uid_pass(uid: str, password: str) -> Optional[Dict]:
 
 
 async def process_account_token(access_token: str) -> Optional[Dict]:
+    if bot_state.is_deleted(access_token, f"tok_{access_token[:20]}"):
+        return None
     cache_key = f"tok_{access_token[:20]}"
     cached = cache_get(cache_key)
     if cached:
         print_success(f"[CACHE HIT] Token {access_token[:10]}... loaded from cache")
         acc_id = str(cached['account_id'])
+        if bot_state.is_deleted(acc_id, uid if 'uid' in locals() else None):
+            return None
         bot_state.register_account(
             uid=acc_id,
             nickname=cached.get('nickname', f"Player_{acc_id}"),
@@ -1907,6 +1921,8 @@ async def process_account_token(access_token: str) -> Optional[Dict]:
         nickname = res_proto.nickname or get_proto_field(dict_res, 4, f"Player_{acc_id}")
         region = majorlogin_response.region or get_proto_field(dict_res, 3, "BD")
 
+        if bot_state.is_deleted(acc_id, uid if 'uid' in locals() else None):
+            return None
         bot_state.register_account(uid=acc_id, nickname=nickname, region=region, level=level, exp=exp, likes=likes)
 
         account_data = {
@@ -2019,6 +2035,8 @@ async def run_account_worker(account_data: Dict, label: str):
 
 async def account_loop_guest(uid: str, password: str):
     while True:
+        if bot_state.is_deleted(uid):
+            break
         try:
             print_info(f"[LOGIN] Starting login for Guest UID: {uid}...")
             try:
@@ -2027,6 +2045,8 @@ async def account_loop_guest(uid: str, password: str):
                 pass
             account_data = await process_account_uid_pass(uid, password)
             if not account_data:
+                if bot_state.is_deleted(uid):
+                    break
                 print_error(f"Login failed for UID: {uid}. Retrying in 15 seconds...")
                 try:
                     bot_state.update_status(str(uid), "ERROR")
@@ -2035,6 +2055,8 @@ async def account_loop_guest(uid: str, password: str):
                 await asyncio.sleep(15)
                 continue
 
+            if bot_state.is_deleted(str(account_data.get("account_id", "")), uid):
+                break
             await run_account_worker(account_data, uid)
             print_warning(f"Session finished for {uid}. Reconnecting in 3s...")
             await asyncio.sleep(3)
@@ -2053,15 +2075,21 @@ async def account_loop_guest(uid: str, password: str):
 async def account_loop_token(token: str):
     token_label = token[:10]
     while True:
+        if bot_state.is_deleted(token, f"tok_{token[:20]}"):
+            break
         try:
             print_info("[LOGIN] Starting login with Access Token...")
             account_data = await process_account_token(token)
             if not account_data:
+                if bot_state.is_deleted(token, f"tok_{token[:20]}"):
+                    break
                 print_error("Login failed for Token. Retrying in 15 seconds...")
                 await asyncio.sleep(15)
                 continue
 
             acc_id = str(account_data['account_id'])
+            if bot_state.is_deleted(acc_id, token, f"tok_{token[:20]}"):
+                break
             await run_account_worker(account_data, acc_id)
             print_warning("Token session finished. Reconnecting in 3s...")
             await asyncio.sleep(3)
@@ -2129,8 +2157,54 @@ async def main():
     async def on_refresh_account_handler(uid):
         await refresh_account_profile(uid)
 
+    async def on_restart_account_handler(uid):
+        uid = str(uid).strip()
+        old_task = bot_state.account_workers.pop(uid, None)
+        credential = bot_state.account_credentials.get(uid)
+        token = None
+        if credential and credential.get("auth_token"):
+            token = str(credential["auth_token"]).strip()
+            old_task = old_task or bot_state.account_workers.pop(token[:10], None)
+
+        if old_task:
+            old_task.cancel()
+            try:
+                await old_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass
+
+        started = False
+        if token:
+            task = asyncio.create_task(account_loop_token(token))
+            bot_state.account_workers[token[:10]] = task
+            started = True
+        else:
+            restart_password = None
+            if credential:
+                restart_password = credential.get("password") or credential.get("account_password")
+            if restart_password:
+                task = asyncio.create_task(account_loop_guest(uid, str(restart_password)))
+                bot_state.account_workers[uid] = task
+                started = True
+            else:
+                for acc in load_accounts():
+                    if str(acc.get("uid", "")).strip() == uid and acc.get("password"):
+                        task = asyncio.create_task(account_loop_guest(uid, str(acc["password"])))
+                        bot_state.account_workers[uid] = task
+                        started = True
+                        break
+
+        account = bot_state.accounts.get(uid)
+        if account:
+            account["status"] = "CONNECTING" if started else "OFFLINE"
+            account["last_updated"] = time.strftime("%H:%M:%S")
+        bot_state.log(f"Account {uid} restart {'started' if started else 'failed'}", "success" if started else "error", uid)
+
     bot_state.refresh_callbacks["on_account_added"] = on_account_added_handler
     bot_state.refresh_callbacks["on_refresh_account"] = on_refresh_account_handler
+    bot_state.refresh_callbacks["on_restart_account"] = on_restart_account_handler
 
     accounts = load_accounts()
 
