@@ -25,6 +25,22 @@ class BotState:
         self.account_workers: Dict[str, asyncio.Task] = {}
         self.refresh_callbacks: Dict[str, Any] = {}
         self.account_credentials: Dict[str, Dict[str, Any]] = {}
+        # UIDs/tokens explicitly deleted from the dashboard. This prevents an
+        # in-flight login from recreating an account after deletion.
+        self.deleted_accounts: set[str] = set()
+
+    def mark_deleted(self, *keys: Any):
+        for key in keys:
+            if key is not None and str(key).strip():
+                self.deleted_accounts.add(str(key).strip())
+
+    def clear_deleted(self, *keys: Any):
+        for key in keys:
+            if key is not None:
+                self.deleted_accounts.discard(str(key).strip())
+
+    def is_deleted(self, *keys: Any) -> bool:
+        return any(key is not None and str(key).strip() in self.deleted_accounts for key in keys)
 
     def log(self, message: str, level: str = "info", uid: Optional[str] = None):
         entry = {
@@ -39,6 +55,8 @@ class BotState:
 
     def register_account(self, uid: str, nickname: str, region: str, level: int, exp: int, likes: int = 0):
         uid_str = str(uid)
+        if self.is_deleted(uid_str):
+            return False
         if uid_str not in self.accounts:
             self.accounts[uid_str] = {
                 "uid": uid_str,
@@ -69,6 +87,7 @@ class BotState:
             acc["status"] = "ONLINE"
             acc["last_updated"] = time.strftime("%H:%M:%S")
         self.recalc_totals()
+        return True
 
     def update_exp(self, uid: str, current_exp: int, level: Optional[int] = None):
         uid_str = str(uid)
@@ -107,6 +126,8 @@ class BotState:
 
 
 bot_state = BotState()
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+ACCOUNTS_FILE = os.path.join(BASE_DIR, "accounts.json")
 
 
 # ==================== DASHBOARD AUTHENTICATION ====================
@@ -318,7 +339,7 @@ async def handle_add_account(request: web.Request) -> web.Response:
     _require_auth(request)
     try:
         data = await request.json()
-        accounts_file = "accounts.json"
+        accounts_file = ACCOUNTS_FILE
         existing = []
         if os.path.exists(accounts_file):
             try:
@@ -346,6 +367,13 @@ async def handle_add_account(request: web.Request) -> web.Response:
         with open(accounts_file, "w", encoding="utf-8") as f:
             json.dump(existing, f, indent=2)
 
+        # A deliberate re-add is allowed to remove the delete tombstone.
+        if data.get("uid"):
+            bot_state.clear_deleted(str(data.get("uid")).strip())
+        if data.get("token"):
+            tok = str(data.get("token")).strip()
+            bot_state.clear_deleted(tok, f"tok_{tok[:20]}")
+
         bot_state.log(f"New account added: {data.get('uid') or 'Token'}", "success")
         
         # Trigger dynamic worker launch
@@ -361,29 +389,101 @@ async def handle_delete_account(request: web.Request) -> web.Response:
     _require_auth(request)
     try:
         data = await request.json()
-        uid = str(data.get("uid")).strip()
-        accounts_file = "accounts.json"
+        uid = str(data.get("uid", "")).strip()
+        if not uid:
+            return web.json_response({"status": "error", "error": "UID is required"}, status=400)
+
+        accounts_file = ACCOUNTS_FILE
+        existing = []
         if os.path.exists(accounts_file):
             with open(accounts_file, "r", encoding="utf-8") as f:
-                existing = json.load(f)
-            existing = [acc for acc in existing if str(acc.get("uid")) != uid]
-            with open(accounts_file, "w", encoding="utf-8") as f:
-                json.dump(existing, f, indent=2)
+                raw = json.load(f)
+                existing = raw if isinstance(raw, list) else []
 
-        if uid in bot_state.accounts:
-            del bot_state.accounts[uid]
+        # Collect every persistent identity for this account before removing it.
+        deleted_uids = {uid}
+        deleted_tokens = set()
+        remaining = []
+        for acc in existing:
+            acc_uid = str(acc.get("uid", "")).strip()
+            acc_id = str(acc.get("account_id", "")).strip()
+            token = str(acc.get("token", "")).strip()
+            if uid in {acc_uid, acc_id}:
+                if acc_uid:
+                    deleted_uids.add(acc_uid)
+                if acc_id:
+                    deleted_uids.add(acc_id)
+                if token:
+                    deleted_tokens.add(token)
+                continue
+            remaining.append(acc)
 
-        if uid in bot_state.account_workers:
-            bot_state.account_workers[uid].cancel()
-            del bot_state.account_workers[uid]
+        # Tombstone first, before cancelling workers. Any in-flight login that
+        # finishes after this point is rejected by register_account().
+        bot_state.mark_deleted(*deleted_uids)
+        for token in deleted_tokens:
+            bot_state.mark_deleted(token, f"tok_{token[:20]}")
 
-        bot_state.log(f"Account {uid} removed from rotation.", "warning", uid)
+        with open(accounts_file, "w", encoding="utf-8") as f:
+            json.dump(remaining, f, indent=2)
+
+        # Remove every runtime representation.
+        for key in list(deleted_uids):
+            bot_state.accounts.pop(key, None)
+            bot_state.account_credentials.pop(key, None)
+        for token in deleted_tokens:
+            bot_state.account_credentials.pop(f"tok_{token[:20]}", None)
+            bot_state.account_credentials.pop(token, None)
+
+        # Cancel all matching workers, including duplicate tasks accidentally
+        # created by repeated Add/Restart actions.
+        worker_keys = set(deleted_uids)
+        worker_keys.update(token[:10] for token in deleted_tokens)
+        tasks = []
+        for key in worker_keys:
+            task = bot_state.account_workers.pop(key, None)
+            if task:
+                tasks.append(task)
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+        bot_state.recalc_totals()
+        bot_state.log(f"Account {uid} removed permanently from rotation.", "warning", uid)
         return web.json_response({"status": "ok"})
     except Exception as e:
-        return web.json_response({"status": "error", "error": str(e)})
+        return web.json_response({"status": "error", "error": str(e)}, status=500)
 
 
-async def handle_refresh_account(request: web.Request) -> web.Response:
+async def handle_restart_account(request: web.Request) -> web.Response:
+    _require_auth(request)
+    try:
+        data = await request.json()
+        uid = str(data.get("uid", "")).strip()
+        if not uid:
+            return web.json_response({"status": "error", "error": "UID is required"}, status=400)
+        if bot_state.is_deleted(uid):
+            return web.json_response({"status": "error", "error": "Account was deleted"}, status=404)
+        account = bot_state.accounts.get(uid)
+        if not account:
+            return web.json_response({"status": "error", "error": "Account not found"}, status=404)
+
+        account["status"] = "RESTARTING"
+        account["last_updated"] = time.strftime("%H:%M:%S")
+        bot_state.log(f"Restart requested for {account.get('nickname', uid)}", "info", uid)
+        callback = bot_state.refresh_callbacks.get("on_restart_account")
+        if not callback:
+            account["status"] = "OFFLINE"
+            return web.json_response({"status": "error", "error": "Restart handler is not available"}, status=503)
+        asyncio.create_task(callback(uid))
+        return web.json_response({"status": "ok", "message": "Account restart initiated"})
+    except Exception as e:
+        return web.json_response({"status": "error", "error": str(e)}, status=500)
+
+
+async def handle_refresh_account(request: web.Request):
     _require_auth(request)
     try:
         data = await request.json()
@@ -411,6 +511,7 @@ async def start_web_dashboard(host: str = "0.0.0.0", port: int = 5000):
     app.router.add_get("/api/account", handle_get_account)
     app.router.add_post("/api/account/add", handle_add_account)
     app.router.add_post("/api/account/delete", handle_delete_account)
+    app.router.add_post("/api/account/restart", handle_restart_account)
     app.router.add_post("/api/account/refresh", handle_refresh_account)
 
     runner = web.AppRunner(app)
